@@ -18,6 +18,7 @@ package org.keycloak.testsuite.actions;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -1273,5 +1274,100 @@ public class RequiredActionEmailVerificationTest extends AbstractTestRealmKeyclo
         userRep = user.toRepresentation();
         assertTrue(userRep.isEmailVerified());
         assertThat(userRep.getRequiredActions(), Matchers.empty());
+    }
+
+    /**
+     * Regression test for KEYCLOAK-42875.
+     *
+     * When an admin sends an execute-actions email containing UPDATE_PASSWORD (or any action other than VERIFY_EMAIL),
+     * and the user opens the emailed link (fresh browser session, triggering the proceed page) and clicks proceed —
+     * the handler must: mark email as verified, remove VERIFY_EMAIL from the user model and auth session, and fire a
+     * VERIFY_EMAIL success event. This must hold even if the user abandons subsequent required actions.
+     */
+    @Test
+    public void executeActionsEmailSetsEmailVerifiedAndFiresVerifyEmailEvent() throws Exception {
+        try (Closeable u = new UserAttributeUpdater(managedRealm.admin().users().get(testUserId))
+                .setEmailVerified(false)
+                .setRequiredActions(RequiredAction.VERIFY_EMAIL)
+                .update()) {
+
+            // Admin triggers execute-actions email with UPDATE_PASSWORD only (not VERIFY_EMAIL explicitly).
+            managedRealm.admin().users().get(testUserId).executeActionsEmail(
+                    List.of(RequiredAction.UPDATE_PASSWORD.name()));
+
+            Assertions.assertEquals(1, mail.getReceivedMessages().length);
+            MimeMessage message = mail.getLastReceivedMessage();
+            String actionUrl = getEmailLink(message);
+
+            // Open in a fresh browser (no existing session) — handler shows the proceed page.
+            driver.manage().deleteAllCookies();
+            driver.navigate().to(actionUrl.trim());
+            proceedPage.assertCurrent();
+            proceedPage.clickProceedLink();
+
+            // User lands on the update-password page but ABANDONS — we stop here to test the verify-email side-effect.
+            updatePasswordPage.assertCurrent();
+
+            // Assert via admin API: email verified flag set, VERIFY_EMAIL required action removed.
+            UserRepresentation userRep = managedRealm.admin().users().get(testUserId).toRepresentation();
+            assertThat("email should be verified after clicking the action-token link", userRep.isEmailVerified(), Matchers.is(true));
+            assertThat("VERIFY_EMAIL required action should have been removed from user model",
+                    userRep.getRequiredActions(), Matchers.not(Matchers.hasItem(RequiredAction.VERIFY_EMAIL.name())));
+
+            // Assert a VERIFY_EMAIL success event was fired.
+            EventRepresentation verifyEmailEvent = events.poll();
+            assertThat("expected a VERIFY_EMAIL event to be fired", verifyEmailEvent, Matchers.notNullValue());
+            EventAssertion.expectRequiredAction(verifyEmailEvent)
+                    .type(EventType.VERIFY_EMAIL)
+                    .userId(testUserId)
+                    .details(Details.EMAIL, "test-user@localhost");
+        }
+    }
+
+    /**
+     * Regression guard for KEYCLOAK-42875 guard path: if the user is already email-verified,
+     * the handler must NOT fire a duplicate VERIFY_EMAIL event.
+     */
+    @Test
+    public void executeActionsEmailDoesNotRefireVerifyEmailEventIfAlreadyVerified() throws Exception {
+        try (Closeable u = new UserAttributeUpdater(managedRealm.admin().users().get(testUserId))
+                .setEmailVerified(true)
+                .setRequiredActions()
+                .update()) {
+
+            managedRealm.admin().users().get(testUserId).executeActionsEmail(
+                    List.of(RequiredAction.UPDATE_PASSWORD.name()));
+
+            Assertions.assertEquals(1, mail.getReceivedMessages().length);
+            MimeMessage message = mail.getLastReceivedMessage();
+            String actionUrl = getEmailLink(message);
+
+            driver.manage().deleteAllCookies();
+            driver.navigate().to(actionUrl.trim());
+            proceedPage.assertCurrent();
+            proceedPage.clickProceedLink();
+
+            // User sees update-password; we stop here — no VERIFY_EMAIL event should have been fired.
+            updatePasswordPage.assertCurrent();
+
+            // Drain the entire event queue into a list so we can inspect every event that fired
+            // during the proceed step, then assert that none of them is a VERIFY_EMAIL event.
+            // Draining (rather than events.clear()) is intentional: it leaves the queue empty so
+            // AssertEvents tearDown is satisfied, while giving us full visibility into what fired.
+            List<EventRepresentation> firedEvents = new ArrayList<>();
+            EventRepresentation ev;
+            while ((ev = events.poll()) != null) {
+                firedEvents.add(ev);
+            }
+
+            assertThat("No VERIFY_EMAIL event should fire when the user is already email-verified",
+                    firedEvents,
+                    Matchers.not(Matchers.hasItem(
+                            Matchers.hasProperty("type", Matchers.equalTo(EventType.VERIFY_EMAIL.name())))));
+
+            // Assert user is still verified and required actions still empty.
+            UserRepresentation userRep = managedRealm.admin().users().get(testUserId).toRepresentation();
+            assertThat("email should still be verified", userRep.isEmailVerified(), Matchers.is(true));
+        }
     }
 }

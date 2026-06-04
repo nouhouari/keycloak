@@ -31,6 +31,7 @@ import org.keycloak.authentication.actiontoken.AbstractActionTokenHandler;
 import org.keycloak.authentication.actiontoken.ActionTokenContext;
 import org.keycloak.authentication.actiontoken.TokenUtils;
 import org.keycloak.authentication.requiredactions.util.RequiredActionsValidator;
+import org.keycloak.events.Details;
 import org.keycloak.events.Errors;
 import org.keycloak.events.EventType;
 import org.keycloak.forms.login.LoginFormsProvider;
@@ -40,6 +41,7 @@ import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.RequiredActionProviderModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserModel.RequiredAction;
 import org.keycloak.protocol.oidc.OIDCLoginProtocol;
 import org.keycloak.protocol.oidc.utils.RedirectUtils;
 import org.keycloak.services.Urls;
@@ -119,7 +121,16 @@ public class ExecuteActionsActionTokenHandler extends AbstractActionTokenHandler
 
         UserModel user = tokenContext.getAuthenticationSession().getAuthenticatedUser();
         // verify user email as we know it is valid as this entry point would never have gotten here.
-        user.setEmailVerified(true);
+        if (!user.isEmailVerified()) {
+            user.setEmailVerified(true);
+            user.removeRequiredAction(RequiredAction.VERIFY_EMAIL);
+            authSession.removeRequiredAction(RequiredAction.VERIFY_EMAIL);
+
+            tokenContext.getEvent().clone()
+                    .event(EventType.VERIFY_EMAIL)
+                    .detail(Details.EMAIL, user.getEmail())
+                    .success();
+        }
 
         String nextAction = AuthenticationManager.nextRequiredAction(tokenContext.getSession(), authSession, tokenContext.getRequest(), tokenContext.getEvent());
         return AuthenticationManager.redirectToRequiredActions(tokenContext.getSession(), tokenContext.getRealm(), authSession, tokenContext.getUriInfo(), nextAction);
